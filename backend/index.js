@@ -1,21 +1,51 @@
+// server.js (updated)
+// -------------------------------------------------------------
+// This server exposes job listings and supports job applications
+// with resume upload + optional PDF text extraction.
+//
+// Expected MySQL tables (reference only):
+//   CREATE TABLE jobs (
+//     id INT AUTO_INCREMENT PRIMARY KEY,
+//     title VARCHAR(255) NOT NULL,
+//     location VARCHAR(255) NOT NULL,
+//     type VARCHAR(100) NOT NULL,
+//     description TEXT NOT NULL,
+//     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+//   );
+//
+//   CREATE TABLE applications (
+//     id INT AUTO_INCREMENT PRIMARY KEY,
+//     job_id INT NOT NULL,
+//     full_name VARCHAR(255) NOT NULL,
+//     email VARCHAR(255) NOT NULL,
+//     phone VARCHAR(50),
+//     cover_letter TEXT,
+//     resume_path VARCHAR(500),
+//     resume_text MEDIUMTEXT,
+//     match_score INT DEFAULT 0,
+//     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+//     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+//   );
+// -------------------------------------------------------------
+
 const bodyParser = require('body-parser');
-const express = require("express");
+const express = require('express');
 const mysql = require('mysql2');
-const cors = require("cors");
-const multer = require("multer");
-const bcrypt = require("bcrypt");
-const path = require("path");
-const fs = require("fs");
-const jwt = require("jsonwebtoken");
+const cors = require('cors');
+const multer = require('multer');
+const bcrypt = require('bcrypt');
+const path = require('path');
+const fs = require('fs');
+const jwt = require('jsonwebtoken');
+const pdfParse = require('pdf-parse');
 
-
-const JWT_SECRET = "your_jwt_secret";
+const JWT_SECRET = 'your_jwt_secret';
 const app = express();
 const PORT = 8081;
 
 // --- FOLDERS ---
-const uploadsDir = path.join(__dirname, "uploads");
-const resumesDir = path.join(uploadsDir, "resumes");
+const uploadsDir = path.join(__dirname, 'uploads');
+const resumesDir = path.join(uploadsDir, 'resumes');
 if (!fs.existsSync(resumesDir)) fs.mkdirSync(resumesDir, { recursive: true });
 
 // --- MIDDLEWARE ---
@@ -23,11 +53,11 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use("/uploads", express.static(uploadsDir));
-app.use("/uploads/resumes", express.static(resumesDir));
+app.use('/uploads', express.static(uploadsDir));
+app.use('/uploads/resumes', express.static(resumesDir));
 
 // --- LOG REQUESTS ---
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   console.log(`📡 [${req.method}] ${req.originalUrl}`);
   next();
 });
@@ -36,154 +66,173 @@ app.use((req, res, next) => {
 let db;
 function handleDBConnection() {
   db = mysql.createConnection({
-    host: "127.0.0.1",
-    user: "root",
-    password: "123456789",
-    database: "db",
+    host: '127.0.0.1',
+    user: 'root',
+    password: '123456789',
+    database: 'db',
   });
 
-  db.connect(err => {
+  db.connect((err) => {
     if (err) {
-      console.error("❌ DB connection failed:", err);
+      console.error('❌ DB connection failed:', err);
       setTimeout(handleDBConnection, 2000);
     } else {
-      console.log("✅ Connected to MySQL");
+      console.log('✅ Connected to MySQL');
     }
   });
 
-  db.on("error", err => {
-    console.error("⚠ MySQL Error:", err);
-    if (err.code === "PROTOCOL_CONNECTION_LOST") handleDBConnection();
+  db.on('error', (err) => {
+    console.error('⚠ MySQL Error:', err);
+    if (err.code === 'PROTOCOL_CONNECTION_LOST') handleDBConnection();
   });
 }
 handleDBConnection();
 
 // --- MULTER CONFIG ---
 const photoStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, `photo-${Date.now()}${path.extname(file.originalname)}`)
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => cb(null, `photo-${Date.now()}${path.extname(file.originalname)}`),
 });
 const resumeStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, resumesDir),
-  filename: (req, file, cb) => cb(null, `resume-${Date.now()}${path.extname(file.originalname)}`)
+  destination: (_req, _file, cb) => cb(null, resumesDir),
+  filename: (_req, file, cb) => cb(null, `resume-${Date.now()}${path.extname(file.originalname)}`),
 });
 const uploadPhoto = multer({ storage: photoStorage });
 const uploadResume = multer({ storage: resumeStorage });
-const uploadEmployeePhoto = multer({ storage: photoStorage });
 
 // --- JWT ADMIN GUARD ---
 function verifyAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "No token provided" });
-  const token = authHeader.split(" ")[1];
+  if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+  const token = authHeader.split(' ')[1];
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).json({ error: "Invalid token" });
-    if (decoded.role.toLowerCase() !== "admin") return res.status(403).json({ error: "Access denied" });
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    if ((decoded.role || '').toLowerCase() !== 'admin') return res.status(403).json({ error: 'Access denied' });
     req.user = decoded;
     next();
   });
 }
 
-//////////////////////
-// 🔹 AUTH ROUTES
-//////////////////////
-app.post("/api/register", uploadPhoto.single("photo"), async (req, res) => {
+// --- HELPERS ---
+async function extractTextFromFile(filePath) {
+  try {
+    const dataBuffer = fs.readFileSync(filePath);
+    const isPdf = path.extname(filePath).toLowerCase() === '.pdf';
+    if (!isPdf) return '';
+    const data = await pdfParse(dataBuffer);
+    return data.text || '';
+  } catch (err) {
+    console.error('Error extracting resume text:', err);
+    return '';
+  }
+}
+
+function calculateMatchScore(resumeText, jobText) {
+  const skills = ['React', 'Node.js', 'Python', 'Docker', 'CI/CD', 'JavaScript', 'MySQL', 'HTML', 'CSS', 'AWS', 'REST API', 'MongoDB', 'Java'];
+  const resumeLower = (resumeText || '').toLowerCase();
+  const jobLower = (jobText || '').toLowerCase();
+  const matched = skills.filter((s) => resumeLower.includes(s.toLowerCase()) && jobLower.includes(s.toLowerCase()));
+  return Math.round((matched.length / skills.length) * 100) || 0;
+}
+
+function daysInclusive(startDate, endDate) {
+  const s = new Date(startDate);
+  const e = new Date(endDate);
+  if (isNaN(s) || isNaN(e)) return 0;
+  const ms = e.setHours(0, 0, 0, 0) - s.setHours(0, 0, 0, 0);
+  return ms < 0 ? 0 : Math.floor(ms / (1000 * 60 * 60 * 24)) + 1;
+}
+
+// ---------------------- AUTH ----------------------
+app.post('/api/register', uploadPhoto.single('photo'), async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
-    if (!name || !email || !password || !role)
-      return res.status(400).json({ error: "All fields are required" });
+    if (!name || !email || !password || !role) return res.status(400).json({ error: 'All fields are required' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const photoPath = req.file ? `uploads/${req.file.filename}` : null;
-    const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
+    const table = role.toLowerCase() === 'admin' ? 'admin' : 'employee1';
 
-    db.query(`INSERT INTO ${table} (name, email, password, photo) VALUES (?, ?, ?, ?)`,
-      [name, email, hashedPassword, photoPath],
-      err => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: `${role} registered successfully` });
-      });
+    db.query(`INSERT INTO ${table} (name, email, password, photo) VALUES (?, ?, ?, ?)`, [name, email, hashedPassword, photoPath], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: `${role} registered successfully` });
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post("/api/login", (req, res) => {
+app.post('/api/login', (req, res) => {
   const { email, password, role } = req.body;
-  if (!email || !password || !role) return res.status(400).json({ error: "Missing fields" });
+  if (!email || !password || !role) return res.status(400).json({ error: 'Missing fields' });
 
-  const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
+  const table = role.toLowerCase() === 'admin' ? 'admin' : 'employee1';
   db.query(`SELECT * FROM ${table} WHERE email=?`, [email], async (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
-    if (results.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+    if (results.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
 
     const user = results[0];
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(401).json({ error: "Invalid credentials" });
+    if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user.id, email: user.email, role }, JWT_SECRET, { expiresIn: "1h" });
+    const token = jwt.sign({ id: user.id, email: user.email, role }, JWT_SECRET, { expiresIn: '1h' });
 
     res.json({
-      message: "Login successful",
+      message: 'Login successful',
       token,
       role,
-      id: user.id,                  // ✅ IMPORTANT: send id
+      id: user.id,
       name: user.name,
       email: user.email,
-      photo: user.photo ? `http://localhost:8081/${user.photo}` : null
+      photo: user.photo ? `http://localhost:${PORT}/${user.photo}` : null,
     });
   });
 });
 
-
-//////////////////////
-// 🔹 EMPLOYEE CRUD
-//////////////////////
-app.get("/api/employees", (req, res) => {
-  db.query("SELECT * FROM employee1", (err, results) => {
-    if (err) return res.status(500).json({ error: err.message });
+// ---------------------- JOBS ----------------------
+// List jobs (public)
+app.get('/api/jobs', (_req, res) => {
+  db.query('SELECT * FROM jobs ORDER BY created_at DESC', (err, results) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
     res.json(results);
   });
 });
 
-//////////////////////
-// 🔹 JOBS
-//////////////////////
-app.get("/api/jobs", (req, res) => {
-  db.query("SELECT * FROM jobs ORDER BY created_at DESC", (err, results) => {
-    if (err) return res.status(500).json({ error: "Database error" });
-    res.json(results);
+// Single job (public) – matches frontend GET /api/public/jobs/:id
+app.get('/api/public/jobs/:id', (req, res) => {
+  db.query('SELECT * FROM jobs WHERE id = ? LIMIT 1', [req.params.id], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (rows.length === 0) return res.status(404).json({ error: 'Job not found' });
+    res.json(rows[0]);
   });
 });
 
-app.post("/api/jobs", verifyAdmin, (req, res) => {
+// Create job (admin)
+app.post('/api/jobs', verifyAdmin, (req, res) => {
   const { title, location, type, description } = req.body;
-  if (!title || !location || !type || !description) {
-    return res.status(400).json({ error: "All fields are required" });
-  }
+  if (!title || !location || !type || !description) return res.status(400).json({ error: 'All fields are required' });
 
-  db.query(
-    "INSERT INTO jobs (title, location, type, description) VALUES (?, ?, ?, ?)",
-    [title, location, type, description],
-    (err, result) => {
-      if (err) {
-        console.error("DB Insert Error:", err);
-        return res.status(500).json({ error: "Failed to insert job" });
-      }
-      res.status(201).json({ message: "Job created", id: result.insertId });
+  db.query('INSERT INTO jobs (title, location, type, description) VALUES (?, ?, ?, ?)', [title, location, type, description], (err, result) => {
+    if (err) {
+      console.error('DB Insert Error:', err);
+      return res.status(500).json({ error: 'Failed to insert job' });
     }
-  );
+    res.status(201).json({ message: 'Job created', id: result.insertId });
+  });
 });
 
+// ---------------------- JOB APPLICATIONS ----------------------
 //////////////////////
 // 🔹 APPLICATIONS + ATS
 //////////////////////
+// ✅ Submit application with resume upload
 app.post("/api/applications/upload", uploadResume.single("resume"), async (req, res) => {
   try {
     const { full_name, email, job_id } = req.body;
     if (!req.file || !full_name || !email || !job_id)
       return res.status(400).json({ message: "Missing required fields or resume" });
 
+    // ✅ Fetch Job Description
     db.query("SELECT description FROM jobs WHERE id=?", [job_id], async (err, results) => {
       if (err || results.length === 0) return res.status(500).json({ message: "Job not found" });
 
@@ -206,9 +255,11 @@ app.post("/api/applications/upload", uploadResume.single("resume"), async (req, 
   }
 });
 
+
+// ✅ Get Applications with Job Titles
 app.get("/api/applications", (req, res) => {
   db.query(`
-    SELECT a.id, a.full_name, a.email, a.resume_path, a.submitted_at, a.ats_score,
+    SELECT a.id, a.full_name, a.email, a.resume_path, a.submitted_at, a.ats_score, a.admin_message,
            j.title AS job_title
     FROM applications a
     JOIN jobs j ON a.job_id = j.id
@@ -219,187 +270,190 @@ app.get("/api/applications", (req, res) => {
   });
 });
 
-app.get("/api/applications/scanned", (req, res) => {
-  db.query(`
-    SELECT a.id, a.full_name, a.email, a.resume_path, a.job_id, a.ats_score, a.submitted_at,
-           j.title AS job_title
+
+// ✅ Save Admin Reply (update admin_message)
+app.put("/api/applications/:id/message", (req, res) => {
+  const { id } = req.params;
+  const { admin_message } = req.body;
+
+  if (!admin_message || !admin_message.trim()) {
+    return res.status(400).json({ message: "Reply message cannot be empty" });
+  }
+
+  const query = "UPDATE applications SET admin_message = ? WHERE id = ?";
+  db.query(query, [admin_message, id], (err, result) => {
+    if (err) {
+      console.error("Error updating reply:", err);
+      return res.status(500).json({ message: "Database update failed" });
+    }
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    res.json({ message: "Reply saved successfully" });
+  });
+});
+
+
+
+// ✅ Delete Application by ID
+app.delete("/api/applications/:id", (req, res) => {
+  const { id } = req.params;
+
+  // First, get the resume filename (so we can delete the file too)
+  db.query("SELECT resume_path FROM applications WHERE id = ?", [id], (err, results) => {
+    if (err) return res.status(500).json({ message: "DB error while finding application" });
+    if (results.length === 0) return res.status(404).json({ message: "Application not found" });
+
+    const resumeFile = results[0].resume_path;
+    const resumePath = path.join(__dirname, "uploads", "resumes", resumeFile);
+
+    // Delete record from DB
+    db.query("DELETE FROM applications WHERE id = ?", [id], (err2) => {
+      if (err2) return res.status(500).json({ message: "DB delete error", error: err2.message });
+
+      // Try deleting resume file (optional, won’t block response if fails)
+      fs.unlink(resumePath, (unlinkErr) => {
+        if (unlinkErr) {
+          console.warn("⚠️ Resume file not removed:", unlinkErr.message);
+        }
+      });
+
+      res.json({ message: "✅ Application deleted successfully" });
+    });
+  });
+});
+// Track application by email
+app.get("/api/public/track-application", (req, res) => {
+  const { email } = req.query;
+
+  if (!email) {
+    return res.status(400).json({ message: "Email is required" });
+  }
+
+  const query = `
+    SELECT a.full_name, a.email, a.admin_message, j.title AS job_title
     FROM applications a
     JOIN jobs j ON a.job_id = j.id
+    WHERE a.email = ?
     ORDER BY a.submitted_at DESC
-  `, (err, results) => {
-    if (err) return res.status(500).json({ message: "Failed to fetch scanned resumes" });
-    res.json(results);
-  });
-});
+    LIMIT 1
+  `;
 
-//////////////////////
-// 🔹 FORGOT PASSWORD
-//////////////////////
-app.post("/api/forgot-password", async (req, res) => {
-  const { email, newPassword, confirmNewPassword, role } = req.body;
-  if (!email || !newPassword || !confirmNewPassword || !role) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
-  if (newPassword !== confirmNewPassword) {
-    return res.status(400).json({ message: "Passwords do not match" });
-  }
-
-  const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
-
-  try {
-    db.query(`SELECT * FROM ${table} WHERE email=?`, [email], async (err, results) => {
-      if (err) return res.status(500).json({ message: "Database error" });
-      if (results.length === 0) return res.status(404).json({ message: "User not found" });
-
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
-      db.query(`UPDATE ${table} SET password=? WHERE email=?`, [hashedPassword, email], (err2) => {
-        if (err2) return res.status(500).json({ message: "Failed to reset password" });
-        res.json({ message: "Password reset successful. Please log in with your new password." });
-      });
-    });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
-
-//////////////////////
-// 🔹 LEAVE APPLICATIONS
-//////////////////////
-
-app.get("/api/leave-approval/pending-count", (req, res) => {
-  const sql = "SELECT COUNT(*) AS count FROM leave_applications WHERE status = 'Pending'";
-  db.query(sql, (err, results) => {
+  db.query(query, [email], (err, results) => {
     if (err) {
-      console.error("Error fetching pending count:", err);
-      return res.status(500).json({ error: err });
+      console.error("DB error:", err);
+      return res.status(500).json({ message: "Database error" });
     }
-    res.json({ count: results[0].count });
+
+    if (results.length === 0) {
+      return res.status(404).json({ message: "No application found for this email" });
+    }
+
+    res.json(results[0]); // return the latest application
   });
 });
 
 
-app.post("/api/leave-applications", (req, res) => {
+// ---------------------- EMPLOYEES ----------------------
+app.get('/api/employees', (_req, res) => {
+  db.query('SELECT * FROM employee1 ORDER BY id DESC', (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(results);
+  });
+});
+
+
+// ---------------------- LEAVE APPLICATIONS ----------------------
+app.post('/api/leave-applications', (req, res) => {
   const { employeeId, leaveType, startDate, endDate } = req.body;
-  console.log("📥 Incoming leave request:", req.body);
-  if (!employeeId || !leaveType || !startDate || !endDate) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
+  if (!employeeId || !leaveType || !startDate || !endDate) return res.status(400).json({ error: 'All fields are required' });
+  if (new Date(endDate) < new Date(startDate)) return res.status(400).json({ error: 'End date cannot be before start date' });
 
-  const getEmpSql = "SELECT name FROM employee1 WHERE id = ?";
-  db.query(getEmpSql, [employeeId], (err, empResults) => {
-    if (err) return res.status(500).json({ message: "Database error" });
-    if (empResults.length === 0) return res.status(404).json({ message: "Employee not found" });
+  const checkEmpSql = 'SELECT 1 FROM employee1 WHERE id = ? LIMIT 1';
+  db.query(checkEmpSql, [employeeId], (chkErr, chkRows) => {
+    if (chkErr) return res.status(500).json({ error: chkErr.message });
+    if (chkRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
-    const employeeName = empResults[0].name;
-    const insertSql = `
-      INSERT INTO leave_applications (employee_id, employeeName, leaveType, startDate, endDate, status)
-      VALUES (?, ?, ?, ?, ?, 'Pending')
-    `;
-    db.query(insertSql, [employeeId, employeeName, leaveType, startDate, endDate], (err2, result) => {
-      if (err2) return res.status(500).json({ message: "Failed to submit leave request", error: err2 });
-      res.json({ message: "✅ Leave request submitted and waiting admin approval", id: result.insertId });
+    const query = `INSERT INTO leave_applications (employee_id, leaveType, startDate, endDate, status) VALUES (?, ?, ?, ?, ?)`;
+    db.query(query, [employeeId, leaveType, startDate, endDate, 'Pending'], (err) => {
+      if (err) {
+        console.error('Error inserting leave request:', err);
+        return res.status(500).json({ message: 'Database error', error: err.message });
+      }
+      res.status(200).json({ message: 'Leave request submitted successfully' });
     });
   });
 });
 
-// Admin: Get all leave applications
-app.get("/api/leave-approval", (req, res) => {
-  const sql = `SELECT * FROM leave_applications ORDER BY id DESC`;
-  db.query(sql, (err, results) => {
-    if (err) return res.status(500).json({ error: err });
-    res.json(results);
-  });
-});
-
-// Employee: Get own leave applications
-app.get("/api/leave-applications/employee/:id", (req, res) => {
-  const sql = `SELECT * FROM leave_applications WHERE employee_id = ? ORDER BY id DESC`;
+app.get('/api/leave/employee/:id', (req, res) => {
+  const sql = `SELECT id, leaveType, startDate, endDate, status FROM leave_applications WHERE employee_id = ? ORDER BY id DESC`;
   db.query(sql, [req.params.id], (err, results) => {
-    if (err) return res.status(500).json({ error: err });
+    if (err) return res.status(500).json({ error: err.message });
     res.json(results);
   });
 });
 
-// Admin updates status
-app.put("/api/leave-applications/:id/status", (req, res) => {
+app.get('/api/leave-approval', (_req, res) => {
+  const sql = `
+    SELECT 
+      la.id,
+      la.employee_id,
+      COALESCE(e.name, '') AS employeeName,
+      la.leaveType,
+      la.startDate,
+      la.endDate,
+      la.status,
+      e.available_leaves
+    FROM leave_applications la
+    LEFT JOIN employee1 e ON la.employee_id = e.id
+    ORDER BY la.id DESC`;
+  db.query(sql, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(results);
+  });
+});
+
+app.put('/api/leave-applications/:id/status', (req, res) => {
   const { status } = req.body;
-  const sql = `UPDATE leave_applications SET status = ? WHERE id = ?`;
-  db.query(sql, [status, req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err });
-    res.json({ message: `Leave ${status}` });
+  const leaveId = req.params.id;
+  if (!status) return res.status(400).json({ message: 'Status is required' });
+
+  const getSql = 'SELECT employee_id, startDate, endDate, status FROM leave_applications WHERE id = ?';
+  db.query(getSql, [leaveId], (err, rows) => {
+    if (err) return res.status(500).json({ message: 'Lookup error', error: err.message });
+    if (rows.length === 0) return res.status(404).json({ message: 'Leave application not found' });
+
+    const appRow = rows[0];
+    if (appRow.status === status) return res.json({ message: `Leave already ${status}` });
+
+    const updateLeaveSql = 'UPDATE leave_applications SET status = ? WHERE id = ?';
+    db.query(updateLeaveSql, [status, leaveId], (err2) => {
+      if (err2) return res.status(500).json({ message: 'Failed to update status', error: err2.message });
+
+      if (status === 'Approved') {
+        const days = daysInclusive(appRow.startDate, appRow.endDate);
+        const deductSql = 'UPDATE employee1 SET available_leaves = GREATEST(available_leaves - ?, 0) WHERE id = ?';
+        db.query(deductSql, [days, appRow.employee_id], (err3) => {
+          if (err3) return res.json({ message: 'Leave Approved, but failed to deduct leaves', error: err3.message });
+          return res.json({ message: `Leave Approved (${days} day${days !== 1 ? 's' : ''} deducted)` });
+        });
+      } else {
+        return res.json({ message: `Leave ${status}` });
+      }
+    });
   });
 });
 
-// Admin delete leave application
-app.delete("/api/leave-applications/:id", (req, res) => {
-  const sql = `DELETE FROM leave_applications WHERE id = ?`;
-  db.query(sql, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err });
-    res.json({ message: "Leave request deleted" });
+app.delete('/api/leave-applications/:id', (req, res) => {
+  db.query('DELETE FROM leave_applications WHERE id = ?', [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Leave request deleted' });
   });
 });
 
-//////////////////////
-// 🔹 MULTI-JOB ATS SCAN
-//////////////////////
-function compareResumeToJob(resumeText, jobText) {
-  const skillSet = [
-    'React', 'Node.js', 'Python', 'Docker', 'CI/CD', 'JavaScript',
-    'MySQL', 'HTML', 'CSS', 'AWS', 'REST API', 'MongoDB'
-  ];
-  const resumeLower = resumeText.toLowerCase();
-  const jobLower = jobText.toLowerCase();
-  const resumeSkills = skillSet.filter(skill => resumeLower.includes(skill.toLowerCase()));
-  const jobSkills = skillSet.filter(skill => jobLower.includes(skill.toLowerCase()));
-  const matchedSkills = jobSkills.filter(skill => resumeSkills.includes(skill));
-  const score = Math.round((matchedSkills.length / jobSkills.length) * 100) || 0;
-  return { score, matchedSkills };
-}
-
-app.get("/api/reports/multi-job-scan", async (req, res) => {
-  try {
-    const query = (sql, params) =>
-      new Promise((resolve, reject) => {
-        db.query(sql, params, (err, results) => {
-          if (err) reject(err);
-          else resolve(results);
-        });
-      });
-
-    const applications = await query("SELECT * FROM applications");
-    const jobs = await query("SELECT * FROM jobs");
-
-    const results = [];
-
-    for (const appData of applications) {
-      let resumeText = "";
-      const resumePath = path.join(resumesDir, appData.resume_path);
-      try {
-        resumeText = await extractTextFromFile(resumePath);
-      } catch (err) {
-        console.error(`Error reading resume for ${appData.full_name}:`, err.message);
-      }
-
-      for (const job of jobs) {
-        const { score, matchedSkills } = compareResumeToJob(resumeText, job.description);
-        results.push({
-          full_name: appData.full_name,
-          email: appData.email,
-          resume_path: appData.resume_path,
-          submitted_at: appData.submitted_at,
-          job_title: job.title,
-          job_id: job.id,
-          ats_score: score,
-          matched_skills: matchedSkills.join(", ")
-        });
-      }
-    }
-
-    res.json(results);
-  } catch (error) {
-    console.error("Error generating ATS scan report:", error);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
+// ---------------------- ROOT ----------------------
+app.get('/', (_req, res) => res.send('API is running ✅'));
 
 app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));

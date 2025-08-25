@@ -20,7 +20,7 @@ const JobApplication = () => {
                 setJob(data);
             } catch (error) {
                 console.error("Could not fetch job details:", error);
-                setJob({ title: 'Job ' });
+                setJob({ title: 'Job Not Found' });
             }
         };
         fetchJobDetails();

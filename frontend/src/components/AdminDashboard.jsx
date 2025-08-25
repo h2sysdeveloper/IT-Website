@@ -1,14 +1,14 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
 import ManageJobs from './ManageJobs';
-import "../styles/AdminDashboard.css";
 import ATSScanner from "./ATSScanner";
+import "../styles/AdminDashboard.css";
 
 const AdminDashboard = () => {
   const [employees, setEmployees] = useState([]);
   const [applications, setApplications] = useState([]);
   const [replyDrafts, setReplyDrafts] = useState({});
-  const [form, setForm] = useState({ name: "", department: "", contact: "", email: "", hire_date: "" });
+  const [form, setForm] = useState({ name: "", department: "", contact: "", email: "", hire_date: "", available_leaves: 20 });
   const [file, setFile] = useState(null);
   const [editId, setEditId] = useState(null);
   const [searchTerm, setSearchTerm] = useState("");
@@ -39,7 +39,6 @@ const AdminDashboard = () => {
     fetchLeaveApproval();
     fetchPendingLeaveCount();
 
-    // Optional: refresh red dot every 30s automatically
     const interval = setInterval(fetchPendingLeaveCount, 30000);
     return () => clearInterval(interval);
   }, []);
@@ -113,7 +112,7 @@ const AdminDashboard = () => {
     try {
       await axios({ method, url, data: formData, headers: { "Content-Type": "multipart/form-data" } });
       fetchEmployees();
-      setForm({ name: "", department: "", contact: "", email: "", hire_date: "" });
+      setForm({ name: "", department: "", contact: "", email: "", hire_date: "", available_leaves: 20 });
       setFile(null);
       setEditId(null);
     } catch (err) {
@@ -129,6 +128,7 @@ const AdminDashboard = () => {
       contact: emp.contact,
       email: emp.email,
       hire_date: emp.hire_date ? emp.hire_date.split("T")[0] : "",
+      available_leaves: emp.available_leaves || 20
     });
   };
 
@@ -147,26 +147,30 @@ const AdminDashboard = () => {
     setReplyDrafts(prev => ({ ...prev, [id]: message }));
   };
 
-  const handleReplySave = async (id) => {
-    const message = replyDrafts[id];
-    if (!message.trim()) {
-      alert("Reply cannot be empty.");
-      return;
-    }
-    try {
-      await axios.put(`http://localhost:8081/api/applications/${id}/message`, { admin_message: message });
-      alert("Reply saved.");
-    } catch (err) {
-      console.error("Reply save failed:", err);
-      alert("Failed to save reply.");
-    }
-  };
+const handleReplySave = async (id) => {
+  const message = replyDrafts[id];
+  if (!message || !message.trim()) {
+    alert("Reply cannot be empty.");
+    return;
+  }
 
+  try {
+    await axios.put(`http://localhost:8081/api/applications/${id}/message`, { admin_message: message });
+    alert("Reply saved.");
+  } catch (err) {
+    console.error("Reply save failed:", err);
+    alert("Failed to save reply.");
+  }
+};
+
+
+  // ✅ Updated: handleApprove deducts available leaves
   const handleApprove = async (leaveId) => {
     try {
       await axios.put(`http://localhost:8081/api/leave-applications/${leaveId}/status`, { status: "Approved" });
       fetchLeaveApproval();
-      fetchPendingLeaveCount(); // ✅ update red dot count
+      fetchPendingLeaveCount();
+      fetchEmployees(); // refresh employees to show updated available leaves
     } catch (err) {
       console.error("Approval failed", err);
       alert("Failed to approve leave!");
@@ -177,7 +181,7 @@ const AdminDashboard = () => {
     try {
       await axios.put(`http://localhost:8081/api/leave-applications/${leaveId}/status`, { status: "Rejected" });
       fetchLeaveApproval();
-      fetchPendingLeaveCount(); // ✅ update red dot count
+      fetchPendingLeaveCount();
     } catch (err) {
       console.error("Rejection failed", err);
       alert("Failed to reject leave!");
@@ -235,6 +239,7 @@ const AdminDashboard = () => {
               <input name="contact" value={form.contact} onChange={handleChange} placeholder="Contact" />
               <input name="email" value={form.email} onChange={handleChange} placeholder="Email" required />
               <input type="date" name="hire_date" value={form.hire_date} onChange={handleChange} />
+              <input type="number" name="available_leaves" value={form.available_leaves} onChange={handleChange} placeholder="Available Leaves" min="0" />
               <input type="file" accept="image/*" onChange={handleFileChange} />
               <button type="submit">{editId ? "Update" : "Add"}</button>
             </form>
@@ -242,7 +247,7 @@ const AdminDashboard = () => {
               <thead>
                 <tr>
                   <th>Photo</th><th>ID</th><th>Name</th><th>Department</th><th>Contact</th>
-                  <th>Email</th><th>Hire Date</th><th>Actions</th>
+                  <th>Email</th><th>Hire Date</th><th>Available Leaves</th><th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -251,56 +256,63 @@ const AdminDashboard = () => {
                     <td>{emp.photo ? <img src={`http://localhost:8081/${emp.photo}`} alt="avatar" className="avatar" /> : "—"}</td>
                     <td>{emp.id}</td><td>{emp.name}</td><td>{emp.department}</td>
                     <td>{emp.contact}</td><td>{emp.email}</td><td>{new Date(emp.hire_date).toLocaleDateString()}</td>
+                    <td>{emp.available_leaves}</td>
                     <td>
                       <button className="icon-button" onClick={() => handleEdit(emp)}>✏</button>
                       <button className="icon-button" onClick={() => handleDelete(emp.id)}>🗑</button>
                     </td>
                   </tr>
-                )) : <tr><td colSpan="8">No employees found.</td></tr>}
+                )) : <tr><td colSpan="9">No employees found.</td></tr>}
               </tbody>
             </table>
           </>
         );
-             
-        
-      case "leave-approval":
-        return (
-          <div>
-            <h3>Leave Approval Requests</h3>
-            <table className="admin-table">
-              <thead>
-                <tr>
-                  <th>ID</th><th>Employee</th><th>Leave Type</th><th>Start Date</th><th>End Date</th>
-                  <th>Status</th><th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {leaveApproval.length ? leaveApproval.map(leave => (
-                  <tr key={leave.id}>
-                    <td>{leave.id}</td>
-                    <td>{leave.employeeName}</td>
-                    <td>{leave.leaveType}</td>
-                    <td>{new Date(leave.startDate).toLocaleDateString()}</td>
-                    <td>{new Date(leave.endDate).toLocaleDateString()}</td>
-                    <td>
-                      {leave.status === 'Pending' && <span style={{color:'#f0ad4e'}}>Pending</span>}
-                      {leave.status === 'Approved' && <span style={{color:'#5cb85c'}}>Approved</span>}
-                      {leave.status === 'Rejected' && <span style={{color:'#d9534f'}}>Rejected</span>}
-                    </td>
-                    <td>
-                      {leave.status === 'Pending' && (
-                        <>
-                          <button className="icon-button" onClick={() => handleApprove(leave.id)}>✔</button>
-                          <button className="icon-button" onClick={() => handleReject(leave.id)}>✖</button>
-                        </>
-                      )}
-                    </td>
-                  </tr>
-                )) : <tr><td colSpan="7">No leave requests found.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        );
+     case "leave-approval":
+  return (
+    <div>
+      <h3>Leave Approval Requests</h3>
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Employee</th>
+            <th>Available Leaves</th>
+            <th>Leave Type</th>
+            <th>Start Date</th>
+            <th>End Date</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {leaveApproval.length ? leaveApproval.map(leave => (
+            <tr key={leave.id}>
+              <td>{leave.id}</td>
+              <td>{leave.employeeName || `EID-${leave.employee_id}`}</td> {/* fallback */}
+              <td>{leave.available_leaves ?? "—"}</td>
+              <td>{leave.leaveType}</td>
+              <td>{new Date(leave.startDate).toLocaleDateString()}</td>
+              <td>{new Date(leave.endDate).toLocaleDateString()}</td>
+              <td>
+                {leave.status === 'Pending' && <span style={{color:'#f0ad4e'}}>Pending</span>}
+                {leave.status === 'Approved' && <span style={{color:'#5cb85c'}}>Approved</span>}
+                {leave.status === 'Rejected' && <span style={{color:'#d9534f'}}>Rejected</span>}
+              </td>
+              <td>
+                {leave.status === 'Pending' && (
+                  <>
+                    <button className="icon-button" onClick={() => handleApprove(leave.id)}>✔</button>
+                    <button className="icon-button" onClick={() => handleReject(leave.id)}>✖</button>
+                  </>
+                )}
+              </td>
+            </tr>
+          )) : <tr><td colSpan="8">No leave requests found.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+
       default:
         return <div><h3>Page not found</h3></div>;
     }
