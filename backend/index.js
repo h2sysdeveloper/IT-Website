@@ -1,3 +1,4 @@
+// server.js  (complete backend file)
 const bodyParser = require('body-parser');
 const express = require("express");
 const mysql = require('mysql2');
@@ -7,20 +8,21 @@ const bcrypt = require("bcrypt");
 const path = require("path");
 const fs = require("fs");
 const jwt = require("jsonwebtoken");
+const util = require("util");
 
-
-const JWT_SECRET = "your_jwt_secret";
+const JWT_SECRET = "your_jwt_secret"; // <-- change this in production
 const app = express();
 const PORT = 8081;
 
 // --- FOLDERS ---
 const uploadsDir = path.join(__dirname, "uploads");
 const resumesDir = path.join(uploadsDir, "resumes");
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 if (!fs.existsSync(resumesDir)) fs.mkdirSync(resumesDir, { recursive: true });
 
 // --- MIDDLEWARE ---
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use("/uploads", express.static(uploadsDir));
@@ -38,8 +40,9 @@ function handleDBConnection() {
   db = mysql.createConnection({
     host: "127.0.0.1",
     user: "root",
-    password: "123456789",
-    database: "db",
+    password: "123456789", // <-- set your DB password
+    database: "db",        // <-- set your DB name
+    multipleStatements: true,
   });
 
   db.connect(err => {
@@ -58,6 +61,16 @@ function handleDBConnection() {
 }
 handleDBConnection();
 
+// Promisify simple query helper
+const dbQuery = (...args) => {
+  return new Promise((resolve, reject) => {
+    db.query(...args, (err, results) => {
+      if (err) return reject(err);
+      resolve(results);
+    });
+  });
+};
+
 // --- MULTER CONFIG ---
 const photoStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
@@ -69,76 +82,202 @@ const resumeStorage = multer.diskStorage({
 });
 const uploadPhoto = multer({ storage: photoStorage });
 const uploadResume = multer({ storage: resumeStorage });
-const uploadEmployeePhoto = multer({ storage: photoStorage });
 
 // --- JWT ADMIN GUARD ---
 function verifyAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "No token provided" });
+  if (!authHeader) return res.status(401).json({ success:false, error: "No token provided" });
   const token = authHeader.split(" ")[1];
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).json({ error: "Invalid token" });
-    if (decoded.role.toLowerCase() !== "admin") return res.status(403).json({ error: "Access denied" });
+    if (err) return res.status(403).json({ success:false, error: "Invalid token" });
+    if (!decoded.role || decoded.role.toLowerCase() !== "admin") return res.status(403).json({ success:false, error: "Access denied" });
     req.user = decoded;
     next();
   });
 }
 
-//////////////////////
-// 🔹 AUTH ROUTES
-//////////////////////
+// ------------------
+// Helper placeholders
+// ------------------
+
+// Basic text extractor for resumes: reads .txt or returns empty for other types.
+// Replace with proper PDF/DOCX parsing for production.
+async function extractTextFromFile(filepath) {
+  try {
+    const ext = path.extname(filepath).toLowerCase();
+    if (ext === ".txt") {
+      return await fs.promises.readFile(filepath, "utf8");
+    }
+    // For PDFs or docx return empty string for now (placeholder)
+    return "";
+  } catch (err) {
+    console.error("extractTextFromFile error:", err);
+    return "";
+  }
+}
+
+// Simple match score between resumeText and jobDescription using word overlap of skill set
+function calculateMatchScore(resumeText, jobDescription) {
+  if (!resumeText || !jobDescription) return 0;
+  const skillSet = [
+    'React', 'Node.js', 'Python', 'Docker', 'CI/CD', 'JavaScript',
+    'MySQL', 'HTML', 'CSS', 'AWS', 'REST API', 'MongoDB'
+  ];
+  const resumeLower = resumeText.toLowerCase();
+  const jobLower = jobDescription.toLowerCase();
+  const jobSkills = skillSet.filter(s => jobLower.includes(s.toLowerCase()));
+  if (!jobSkills.length) return 0;
+  const matched = jobSkills.filter(s => resumeLower.includes(s.toLowerCase()));
+  const score = Math.round((matched.length / jobSkills.length) * 100);
+  return score;
+}
+
+// ------------------
+// AUTH ROUTES
+// ------------------
+
+// Robust Register
 app.post("/api/register", uploadPhoto.single("photo"), async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
-    if (!name || !email || !password || !role)
-      return res.status(400).json({ error: "All fields are required" });
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ success: false, message: "All fields are required (name, email, password, role)" });
+    }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const photoPath = req.file ? `uploads/${req.file.filename}` : null;
     const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
 
-    db.query(`INSERT INTO ${table} (name, email, password, photo) VALUES (?, ?, ?, ?)`,
-      [name, email, hashedPassword, photoPath],
-      err => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: `${role} registered successfully` });
-      });
+    // check existing
+    db.query(`SELECT id FROM ${table} WHERE email = ?`, [email], async (err, rows) => {
+      if (err) {
+        console.error("Register: DB lookup error:", err);
+        return res.status(500).json({ success: false, message: "Database error" });
+      }
+      if (rows.length > 0) return res.status(409).json({ success: false, message: "Email already registered" });
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const photoPath = req.file ? `uploads/${req.file.filename}` : null;
+
+      db.query(
+        `INSERT INTO ${table} (name, email, password, photo) VALUES (?, ?, ?, ?)`,
+        [name, email, hashedPassword, photoPath],
+        (err2, result) => {
+          if (err2) {
+            console.error("Register: DB insert error:", err2);
+            return res.status(500).json({ success: false, message: "Failed to register user" });
+          }
+          return res.status(201).json({
+            success: true,
+            message: `${role} registered successfully`,
+            id: result.insertId,
+            name,
+            email,
+            photo: photoPath ? `http://localhost:${PORT}/${photoPath}` : null
+          });
+        }
+      );
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("Register error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
+// Robust Login
 app.post("/api/login", (req, res) => {
   const { email, password, role } = req.body;
-  if (!email || !password || !role) return res.status(400).json({ error: "Missing fields" });
+  if (!email || !password) return res.status(400).json({ success: false, message: "Missing email or password" });
 
-  const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
-  db.query(`SELECT * FROM ${table} WHERE email=?`, [email], async (err, results) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (results.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+  const tryTable = (table, cb) => db.query(`SELECT * FROM ${table} WHERE email = ?`, [email], cb);
 
-    const user = results[0];
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(401).json({ error: "Invalid credentials" });
-
-    const token = jwt.sign({ id: user.id, email: user.email, role }, JWT_SECRET, { expiresIn: "1h" });
-
-    res.json({
+  const finalizeLogin = (userRow, roleName) => {
+    const token = jwt.sign({ id: userRow.id, email: userRow.email, role: roleName }, JWT_SECRET, { expiresIn: "1h" });
+    return res.json({
+      success: true,
       message: "Login successful",
       token,
-      role,
-      id: user.id,                  // ✅ IMPORTANT: send id
-      name: user.name,
-      email: user.email,
-      photo: user.photo ? `http://localhost:8081/${user.photo}` : null
+      role: roleName,
+      id: userRow.id,
+      name: userRow.name,
+      email: userRow.email,
+      photo: userRow.photo ? `http://localhost:${PORT}/${userRow.photo}` : null
+    });
+  };
+
+  if (role) {
+    const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
+    tryTable(table, async (err, results) => {
+      if (err) return res.status(500).json({ success: false, message: "Database error" });
+      if (!results.length) return res.status(401).json({ success: false, message: "Invalid credentials" });
+      const user = results[0];
+      const match = await bcrypt.compare(password, user.password);
+      if (!match) return res.status(401).json({ success: false, message: "Invalid credentials" });
+      return finalizeLogin(user, role);
+    });
+    return;
+  }
+
+  // try employee then admin
+  tryTable("employee1", async (err, results) => {
+    if (err) return res.status(500).json({ success: false, message: "Database error" });
+    if (results.length) {
+      const user = results[0];
+      const match = await bcrypt.compare(password, user.password);
+      if (match) return finalizeLogin(user, "Employee");
+      else return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+    tryTable("admin", async (err2, results2) => {
+      if (err2) return res.status(500).json({ success: false, message: "Database error" });
+      if (!results2.length) return res.status(401).json({ success: false, message: "Invalid credentials" });
+      const user = results2[0];
+      const match = await bcrypt.compare(password, user.password);
+      if (!match) return res.status(401).json({ success: false, message: "Invalid credentials" });
+      return finalizeLogin(user, "Admin");
     });
   });
 });
 
+// Robust Forgot Password
+app.post("/api/forgot-password", async (req, res) => {
+  try {
+    const { email, newPassword, confirmNewPassword, role } = req.body;
+    if (!email || !newPassword || !confirmNewPassword) return res.status(400).json({ success: false, message: "Email and new passwords are required" });
+    if (newPassword !== confirmNewPassword) return res.status(400).json({ success: false, message: "Passwords do not match" });
 
-//////////////////////
-// 🔹 EMPLOYEE CRUD
-//////////////////////
+    const table = role ? (role.toLowerCase() === "admin" ? "admin" : "employee1") : null;
+
+    const findAndUpdate = (tableName) => {
+      db.query(`SELECT * FROM ${tableName} WHERE email = ?`, [email], async (err, results) => {
+        if (err) return res.status(500).json({ success: false, message: "Database error" });
+        if (!results.length) return res.status(404).json({ success: false, message: "User not found" });
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        db.query(`UPDATE ${tableName} SET password = ? WHERE email = ?`, [hashedPassword, email], (uerr) => {
+          if (uerr) return res.status(500).json({ success: false, message: "Failed to reset password" });
+          return res.json({ success: true, message: "Password reset successful. Please log in with your new password." });
+        });
+      });
+    };
+
+    if (table) return findAndUpdate(table);
+
+    // else search employee1 then admin
+    db.query("SELECT * FROM employee1 WHERE email = ?", [email], (err, rows) => {
+      if (err) return res.status(500).json({ success: false, message: "Database error" });
+      if (rows.length) return findAndUpdate("employee1");
+      db.query("SELECT * FROM admin WHERE email = ?", [email], (err2, rows2) => {
+        if (err2) return res.status(500).json({ success: false, message: "Database error" });
+        if (!rows2.length) return res.status(404).json({ success: false, message: "User not found" });
+        return findAndUpdate("admin");
+      });
+    });
+  } catch (err) {
+    console.error("Forgot-password error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ------------------
+// EMPLOYEE CRUD
+// ------------------
 app.get("/api/employees", (req, res) => {
   db.query("SELECT * FROM employee1", (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -146,9 +285,42 @@ app.get("/api/employees", (req, res) => {
   });
 });
 
-//////////////////////
-// 🔹 JOBS
-//////////////////////
+// Add, Update, Delete employee (simple)
+app.post("/api/employees", uploadPhoto.single("photo"), (req, res) => {
+  const { name, department, contact, email, hire_date } = req.body;
+  const photo = req.file ? `uploads/${req.file.filename}` : null;
+  db.query("INSERT INTO employee1 (name, department, contact, email, hire_date, photo) VALUES (?, ?, ?, ?, ?, ?)",
+    [name, department, contact, email, hire_date || null, photo],
+    (err, result) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true, id: result.insertId });
+    });
+});
+
+app.put("/api/employees/:id", uploadPhoto.single("photo"), (req, res) => {
+  const id = req.params.id;
+  const { name, department, contact, email, hire_date } = req.body;
+  const photo = req.file ? `uploads/${req.file.filename}` : null;
+  const sql = photo
+    ? "UPDATE employee1 SET name=?, department=?, contact=?, email=?, hire_date=?, photo=? WHERE id=?"
+    : "UPDATE employee1 SET name=?, department=?, contact=?, email=?, hire_date=? WHERE id=?";
+  const params = photo ? [name, department, contact, email, hire_date || null, photo, id] : [name, department, contact, email, hire_date || null, id];
+  db.query(sql, params, (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ success: true });
+  });
+});
+
+app.delete("/api/employees/:id", (req, res) => {
+  db.query("DELETE FROM employee1 WHERE id = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ success: true });
+  });
+});
+
+// ------------------
+// JOBS
+// ------------------
 app.get("/api/jobs", (req, res) => {
   db.query("SELECT * FROM jobs ORDER BY created_at DESC", (err, results) => {
     if (err) return res.status(500).json({ error: "Database error" });
@@ -158,60 +330,48 @@ app.get("/api/jobs", (req, res) => {
 
 app.post("/api/jobs", verifyAdmin, (req, res) => {
   const { title, location, type, description } = req.body;
-  if (!title || !location || !type || !description) {
-    return res.status(400).json({ error: "All fields are required" });
-  }
-
-  db.query(
-    "INSERT INTO jobs (title, location, type, description) VALUES (?, ?, ?, ?)",
-    [title, location, type, description],
-    (err, result) => {
-      if (err) {
-        console.error("DB Insert Error:", err);
-        return res.status(500).json({ error: "Failed to insert job" });
-      }
+  if (!title || !location || !type || !description) return res.status(400).json({ error: "All fields are required" });
+  db.query("INSERT INTO jobs (title, location, type, description, created_at) VALUES (?, ?, ?, ?, NOW())",
+    [title, location, type, description], (err, result) => {
+      if (err) return res.status(500).json({ error: "Failed to insert job" });
       res.status(201).json({ message: "Job created", id: result.insertId });
-    }
-  );
+    });
 });
 
-//////////////////////
-// 🔹 APPLICATIONS + ATS
-//////////////////////
+// ------------------
+// APPLICATIONS + ATS
+// ------------------
 app.post("/api/applications/upload", uploadResume.single("resume"), async (req, res) => {
   try {
     const { full_name, email, job_id } = req.body;
-    if (!req.file || !full_name || !email || !job_id)
-      return res.status(400).json({ message: "Missing required fields or resume" });
+    if (!req.file || !full_name || !email || !job_id) return res.status(400).json({ message: "Missing required fields or resume" });
 
-    db.query("SELECT description FROM jobs WHERE id=?", [job_id], async (err, results) => {
-      if (err || results.length === 0) return res.status(500).json({ message: "Job not found" });
+    const jobRows = await dbQuery("SELECT description FROM jobs WHERE id=?", [job_id]);
+    if (!jobRows.length) return res.status(404).json({ message: "Job not found" });
 
-      const jobDescription = results[0].description;
-      const resumeText = await extractTextFromFile(req.file.path);
-      const atsScore = calculateMatchScore(resumeText, jobDescription);
+    const jobDescription = jobRows[0].description || "";
+    const resumeText = await extractTextFromFile(req.file.path);
+    const atsScore = calculateMatchScore(resumeText, jobDescription);
 
-      db.query(
-        `INSERT INTO applications (full_name, email, resume_path, job_id, submitted_at, ats_score)
-         VALUES (?, ?, ?, ?, NOW(), ?)`,
-        [full_name, email, req.file.filename, job_id, atsScore],
-        err2 => {
-          if (err2) return res.status(500).json({ message: "DB Insert Error", error: err2.message });
-          res.json({ message: "Application submitted", atsScore });
-        }
-      );
-    });
+    await dbQuery(
+      `INSERT INTO applications (full_name, email, resume_path, job_id, submitted_at, ats_score)
+       VALUES (?, ?, ?, ?, NOW(), ?)`,
+      [full_name, email, req.file.filename, job_id, atsScore]
+    );
+
+    res.json({ message: "Application submitted", atsScore });
   } catch (error) {
+    console.error("Applications upload error:", error);
     res.status(500).json({ message: "ATS processing failed", error: error.message });
   }
 });
 
 app.get("/api/applications", (req, res) => {
   db.query(`
-    SELECT a.id, a.full_name, a.email, a.resume_path, a.submitted_at, a.ats_score,
+    SELECT a.id, a.full_name, a.email, a.resume_path, a.submitted_at, a.ats_score, a.admin_message,
            j.title AS job_title
     FROM applications a
-    JOIN jobs j ON a.job_id = j.id
+    LEFT JOIN jobs j ON a.job_id = j.id
     ORDER BY a.submitted_at DESC
   `, (err, results) => {
     if (err) return res.status(500).json({ message: "Failed to fetch applications" });
@@ -224,7 +384,7 @@ app.get("/api/applications/scanned", (req, res) => {
     SELECT a.id, a.full_name, a.email, a.resume_path, a.job_id, a.ats_score, a.submitted_at,
            j.title AS job_title
     FROM applications a
-    JOIN jobs j ON a.job_id = j.id
+    LEFT JOIN jobs j ON a.job_id = j.id
     ORDER BY a.submitted_at DESC
   `, (err, results) => {
     if (err) return res.status(500).json({ message: "Failed to fetch scanned resumes" });
@@ -232,156 +392,260 @@ app.get("/api/applications/scanned", (req, res) => {
   });
 });
 
-//////////////////////
-// 🔹 FORGOT PASSWORD
-//////////////////////
-app.post("/api/forgot-password", async (req, res) => {
-  const { email, newPassword, confirmNewPassword, role } = req.body;
-  if (!email || !newPassword || !confirmNewPassword || !role) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
-  if (newPassword !== confirmNewPassword) {
-    return res.status(400).json({ message: "Passwords do not match" });
-  }
+app.put("/api/applications/:id/message", (req, res) => {
+  const { admin_message } = req.body;
+  db.query("UPDATE applications SET admin_message = ? WHERE id = ?", [admin_message, req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: "Failed to save message" });
+    res.json({ message: "Message saved" });
+  });
+});
 
-  const table = role.toLowerCase() === "admin" ? "admin" : "employee1";
+// ------------------
+// FACE DESCRIPTOR + ATTENDANCE
+// ------------------
 
-  try {
-    db.query(`SELECT * FROM ${table} WHERE email=?`, [email], async (err, results) => {
-      if (err) return res.status(500).json({ message: "Database error" });
-      if (results.length === 0) return res.status(404).json({ message: "User not found" });
-
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
-      db.query(`UPDATE ${table} SET password=? WHERE email=?`, [hashedPassword, email], (err2) => {
-        if (err2) return res.status(500).json({ message: "Failed to reset password" });
-        res.json({ message: "Password reset successful. Please log in with your new password." });
+// Helper: load all descriptors from DB
+function loadAllDescriptorsFromDB() {
+  return new Promise((resolve, reject) => {
+    db.query("SELECT employee_id, descriptor_json FROM face_descriptors", (err, results) => {
+      if (err) return reject(err);
+      const map = {};
+      results.forEach(r => {
+        try {
+          const arr = JSON.parse(r.descriptor_json);
+          if (!map[r.employee_id]) map[r.employee_id] = [];
+          if (Array.isArray(arr[0])) map[r.employee_id].push(...arr);
+          else map[r.employee_id].push(arr);
+        } catch (e) {
+          console.warn("Invalid descriptor JSON for employee:", r.employee_id);
+        }
       });
+      resolve(map);
     });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+  });
+}
+
+// Euclidean distance (128-d vector expected)
+function euclidean(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return Math.sqrt(sum);
+}
+
+// Enroll face descriptor (admin or employee enroll)
+app.post("/api/enroll-face", (req, res) => {
+  const { employeeId, descriptor } = req.body;
+  if (!employeeId || !descriptor || !Array.isArray(descriptor)) {
+    return res.status(400).json({ error: "employeeId and descriptor array required" });
+  }
+  const descriptorJson = JSON.stringify(descriptor);
+  db.query("INSERT INTO face_descriptors (employee_id, descriptor_json) VALUES (?, ?)", [employeeId, descriptorJson], (err, result) => {
+    if (err) {
+      console.error("Enroll error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+    res.json({ message: "Face descriptor saved", id: result.insertId });
+  });
+});
+
+// Attendance mark & match
+app.post("/api/attendance/mark", async (req, res) => {
+  try {
+    const { descriptor, imageBase64 } = req.body;
+    if (!descriptor || !Array.isArray(descriptor)) return res.status(400).json({ matched: false, message: "descriptor required" });
+
+    const all = await loadAllDescriptorsFromDB();
+    let best = { employee_id: null, distance: Infinity };
+
+    for (const empId of Object.keys(all)) {
+      const descriptors = all[empId];
+      for (const d of descriptors) {
+        const dist = euclidean(descriptor, d);
+        if (dist < best.distance) best = { employee_id: empId, distance: dist };
+      }
+    }
+
+    const THRESHOLD = 0.6;
+    if (!best.employee_id || best.distance > THRESHOLD) {
+      return res.json({ matched: false, message: "No match (distance " + best.distance.toFixed(3) + ")" });
+    }
+
+    const matchedEmployeeId = best.employee_id;
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const morningStart = 10 * 60 + 30; // 10:30
+    const morningEnd = 11 * 60 + 0;    // 11:00
+    const eveningStart = 18 * 60 + 0;  // 18:00
+    const eveningEnd = 18 * 60 + 30;   // 18:30
+
+    function saveImageIfProvided(cb) {
+      if (!imageBase64) return cb(null, null);
+      const matches = imageBase64.match(/^data:(image\/\w+);base64,(.+)$/);
+      const b64 = matches ? matches[2] : imageBase64;
+      const ext = matches ? matches[1].split("/")[1] : "jpg";
+      const filename = `attendance-${matchedEmployeeId}-${Date.now()}.${ext}`;
+      const filepath = path.join(uploadsDir, filename);
+      fs.writeFile(filepath, Buffer.from(b64, "base64"), (err2) => {
+        if (err2) return cb(err2);
+        const publicPath = `uploads/${filename}`;
+        cb(null, publicPath);
+      });
+    }
+
+    // find today's attendance
+    db.query("SELECT * FROM attendance WHERE employee_id = ? AND date = ?", [matchedEmployeeId, todayStr], (err, rows) => {
+      if (err) return res.status(500).json({ matched: true, message: "DB error", error: err.message });
+
+      const row = rows.length ? rows[0] : null;
+
+      // morning
+      if (currentMinutes >= morningStart && currentMinutes <= morningEnd) {
+        if (!row) {
+          saveImageIfProvided((imgErr, imgPath) => {
+            if (imgErr) console.error("Image save error:", imgErr);
+            const insertSql = "INSERT INTO attendance (employee_id, date, status, check_in, photo) VALUES (?, ?, ?, ?, ?)";
+            db.query(insertSql, [matchedEmployeeId, todayStr, 'Present', now.toTimeString().split(" ")[0], imgPath], (err2) => {
+              if (err2) return res.status(500).json({ matched: true, message: err2.message });
+              return res.json({ matched: true, employee_id: matchedEmployeeId, slot: "morning", result: "checked_in", message: "Morning check-in recorded (half-day until evening check)" });
+            });
+          });
+        } else {
+          if (row.check_in) return res.json({ matched: true, employee_id: matchedEmployeeId, message: "Morning already recorded" });
+          saveImageIfProvided((imgErr, imgPath) => {
+            const upd = "UPDATE attendance SET check_in = ?, photo = ? WHERE id = ?";
+            db.query(upd, [now.toTimeString().split(" ")[0], imgPath, row.id], (err3) => {
+              if (err3) return res.status(500).json({ matched: true, message: err3.message });
+              return res.json({ matched: true, employee_id: matchedEmployeeId, slot: "morning", result: "check_in_updated", message: "Morning check-in recorded" });
+            });
+          });
+        }
+        return;
+      }
+
+      // evening
+      if (currentMinutes >= eveningStart && currentMinutes <= eveningEnd) {
+        if (!row) {
+          saveImageIfProvided((imgErr, imgPath) => {
+            if (imgErr) console.error("Image save error:", imgErr);
+            const insertSql = "INSERT INTO attendance (employee_id, date, status, check_out, photo) VALUES (?, ?, ?, ?, ?)";
+            db.query(insertSql, [matchedEmployeeId, todayStr, 'Present', now.toTimeString().split(" ")[0], imgPath], (err2) => {
+              if (err2) return res.status(500).json({ matched: true, message: err2.message });
+              return res.json({ matched: true, employee_id: matchedEmployeeId, slot: "evening", result: "checked_out_only", message: "Evening check-out recorded (half-day since no morning check-in)" });
+            });
+          });
+        } else {
+          if (row.check_out) return res.json({ matched: true, employee_id: matchedEmployeeId, message: "Evening already recorded" });
+          saveImageIfProvided((imgErr, imgPath) => {
+            const upd = "UPDATE attendance SET check_out = ?, photo = ? WHERE id = ?";
+            db.query(upd, [now.toTimeString().split(" ")[0], imgPath, row.id], (err4) => {
+              if (err4) return res.status(500).json({ matched: true, message: err4.message });
+
+              const isFull = !!row.check_in;
+              const respMsg = isFull ? "Full day recorded (check-in + check-out)" : "Check-out recorded; only one slot present -> Half day";
+              db.query("UPDATE attendance SET status = ? WHERE id = ?", ['Present', row.id], (err5) => {
+                if (err5) console.warn("Could not update status column:", err5.message);
+                return res.json({ matched: true, employee_id: matchedEmployeeId, slot: "evening", result: isFull ? "full_day" : "half_day", message: respMsg });
+              });
+            });
+          });
+        }
+        return;
+      }
+
+      // not in window
+      return res.json({ matched: true, employee_id: matchedEmployeeId, message: "Not in attendance window. Morning 10:30-11:00 and Evening 18:00-18:30" });
+    });
+  } catch (err) {
+    console.error("Attendance mark error:", err);
+    res.status(500).json({ matched: false, message: err.message });
   }
 });
 
-//////////////////////
-// 🔹 LEAVE APPLICATIONS
-//////////////////////
-
+// ------------------
+// LEAVE APPLICATIONS
+// ------------------
 app.get("/api/leave-approval/pending-count", (req, res) => {
   const sql = "SELECT COUNT(*) AS count FROM leave_applications WHERE status = 'Pending'";
   db.query(sql, (err, results) => {
-    if (err) {
-      console.error("Error fetching pending count:", err);
-      return res.status(500).json({ error: err });
-    }
+    if (err) return res.status(500).json({ error: err });
     res.json({ count: results[0].count });
   });
 });
 
-
 app.post("/api/leave-applications", (req, res) => {
   const { employeeId, leaveType, startDate, endDate } = req.body;
-  console.log("📥 Incoming leave request:", req.body);
-  if (!employeeId || !leaveType || !startDate || !endDate) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
+  if (!employeeId || !leaveType || !startDate || !endDate) return res.status(400).json({ message: "All fields are required" });
 
-  const getEmpSql = "SELECT name FROM employee1 WHERE id = ?";
-  db.query(getEmpSql, [employeeId], (err, empResults) => {
+  db.query("SELECT name FROM employee1 WHERE id = ?", [employeeId], (err, empResults) => {
     if (err) return res.status(500).json({ message: "Database error" });
-    if (empResults.length === 0) return res.status(404).json({ message: "Employee not found" });
+    if (!empResults.length) return res.status(404).json({ message: "Employee not found" });
 
     const employeeName = empResults[0].name;
-    const insertSql = `
-      INSERT INTO leave_applications (employee_id, employeeName, leaveType, startDate, endDate, status)
-      VALUES (?, ?, ?, ?, ?, 'Pending')
-    `;
-    db.query(insertSql, [employeeId, employeeName, leaveType, startDate, endDate], (err2, result) => {
-      if (err2) return res.status(500).json({ message: "Failed to submit leave request", error: err2 });
-      res.json({ message: "✅ Leave request submitted and waiting admin approval", id: result.insertId });
-    });
+    db.query(`INSERT INTO leave_applications (employee_id, employeeName, leaveType, startDate, endDate, status) VALUES (?, ?, ?, ?, ?, 'Pending')`,
+      [employeeId, employeeName, leaveType, startDate, endDate], (err2, result) => {
+        if (err2) return res.status(500).json({ message: "Failed to submit leave request", error: err2 });
+        res.json({ message: "Leave request submitted", id: result.insertId });
+      });
   });
 });
 
-// Admin: Get all leave applications
 app.get("/api/leave-approval", (req, res) => {
-  const sql = `SELECT * FROM leave_applications ORDER BY id DESC`;
-  db.query(sql, (err, results) => {
+  db.query("SELECT * FROM leave_applications ORDER BY id DESC", (err, results) => {
     if (err) return res.status(500).json({ error: err });
     res.json(results);
   });
 });
 
-// Employee: Get own leave applications
 app.get("/api/leave-applications/employee/:id", (req, res) => {
-  const sql = `SELECT * FROM leave_applications WHERE employee_id = ? ORDER BY id DESC`;
-  db.query(sql, [req.params.id], (err, results) => {
+  db.query("SELECT * FROM leave_applications WHERE employee_id = ? ORDER BY id DESC", [req.params.id], (err, results) => {
     if (err) return res.status(500).json({ error: err });
     res.json(results);
   });
 });
 
-// Admin updates status
 app.put("/api/leave-applications/:id/status", (req, res) => {
   const { status } = req.body;
-  const sql = `UPDATE leave_applications SET status = ? WHERE id = ?`;
-  db.query(sql, [status, req.params.id], (err) => {
+  db.query("UPDATE leave_applications SET status = ? WHERE id = ?", [status, req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err });
     res.json({ message: `Leave ${status}` });
   });
 });
 
-// Admin delete leave application
 app.delete("/api/leave-applications/:id", (req, res) => {
-  const sql = `DELETE FROM leave_applications WHERE id = ?`;
-  db.query(sql, [req.params.id], (err) => {
+  db.query("DELETE FROM leave_applications WHERE id = ?", [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err });
     res.json({ message: "Leave request deleted" });
   });
 });
 
-//////////////////////
-// 🔹 MULTI-JOB ATS SCAN
-//////////////////////
-function compareResumeToJob(resumeText, jobText) {
-  const skillSet = [
-    'React', 'Node.js', 'Python', 'Docker', 'CI/CD', 'JavaScript',
-    'MySQL', 'HTML', 'CSS', 'AWS', 'REST API', 'MongoDB'
-  ];
-  const resumeLower = resumeText.toLowerCase();
-  const jobLower = jobText.toLowerCase();
-  const resumeSkills = skillSet.filter(skill => resumeLower.includes(skill.toLowerCase()));
-  const jobSkills = skillSet.filter(skill => jobLower.includes(skill.toLowerCase()));
-  const matchedSkills = jobSkills.filter(skill => resumeSkills.includes(skill));
-  const score = Math.round((matchedSkills.length / jobSkills.length) * 100) || 0;
-  return { score, matchedSkills };
-}
-
+// ------------------
+// MULTI-JOB ATS SCAN REPORT
+// ------------------
 app.get("/api/reports/multi-job-scan", async (req, res) => {
   try {
-    const query = (sql, params) =>
-      new Promise((resolve, reject) => {
-        db.query(sql, params, (err, results) => {
-          if (err) reject(err);
-          else resolve(results);
-        });
-      });
-
-    const applications = await query("SELECT * FROM applications");
-    const jobs = await query("SELECT * FROM jobs");
+    const applications = await dbQuery("SELECT * FROM applications");
+    const jobs = await dbQuery("SELECT * FROM jobs");
 
     const results = [];
-
     for (const appData of applications) {
       let resumeText = "";
-      const resumePath = path.join(resumesDir, appData.resume_path);
+      const resumePath = path.join(resumesDir, appData.resume_path || "");
       try {
         resumeText = await extractTextFromFile(resumePath);
       } catch (err) {
         console.error(`Error reading resume for ${appData.full_name}:`, err.message);
       }
-
       for (const job of jobs) {
-        const { score, matchedSkills } = compareResumeToJob(resumeText, job.description);
+        const { score, matchedSkills } = (() => {
+          const score = calculateMatchScore(resumeText, job.description || "");
+          // For compatibility with earlier code structure
+          const matchedSkills = [];
+          return { score, matchedSkills };
+        })();
         results.push({
           full_name: appData.full_name,
           email: appData.email,
@@ -390,7 +654,7 @@ app.get("/api/reports/multi-job-scan", async (req, res) => {
           job_title: job.title,
           job_id: job.id,
           ats_score: score,
-          matched_skills: matchedSkills.join(", ")
+          matched_skills: "" // placeholder
         });
       }
     }
@@ -402,4 +666,7 @@ app.get("/api/reports/multi-job-scan", async (req, res) => {
   }
 });
 
+// ------------------
+// START SERVER
+// ------------------
 app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));

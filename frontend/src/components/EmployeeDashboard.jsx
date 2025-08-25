@@ -1,7 +1,9 @@
+// src/pages/EmployeeDashboard.jsx   (adjust path/name to your project)
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import "../styles/AdminDashboard.css";
+import AttendancePanel from "./AttendancePanel"; 
 
 const EmployeeDashboard = () => {
   const [employee, setEmployee] = useState(null);
@@ -147,6 +149,15 @@ const EmployeeDashboard = () => {
                 )) : <tr><td colSpan="4">No leave requests found.</td></tr>}
               </tbody>
             </table>
+          </div>
+        );
+
+      case "attendance":
+        // <-- NEW: show AttendancePanel here
+        return (
+          <div className="card-box">
+            <h2>Attendance</h2>
+            <AttendancePanel employee={employee} />
           </div>
         );
 

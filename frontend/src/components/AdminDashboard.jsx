@@ -25,7 +25,7 @@ const AdminDashboard = () => {
       const user = JSON.parse(storedUser);
       setLoggedInAdmin(user);
       if (user.role !== "Admin") {
-        alert("Access denied: Admins only.");
+        alert("Access denied: Admins only.");  
         window.location.href = "/";
         return;
       }
