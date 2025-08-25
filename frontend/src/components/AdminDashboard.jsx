@@ -153,7 +153,6 @@ const handleReplySave = async (id) => {
     alert("Reply cannot be empty.");
     return;
   }
-
   try {
     await axios.put(`http://localhost:8081/api/applications/${id}/message`, { admin_message: message });
     alert("Reply saved.");
@@ -162,8 +161,6 @@ const handleReplySave = async (id) => {
     alert("Failed to save reply.");
   }
 };
-
-
   // ✅ Updated: handleApprove deducts available leaves
   const handleApprove = async (leaveId) => {
     try {
@@ -267,7 +264,7 @@ const handleReplySave = async (id) => {
             </table>
           </>
         );
-     case "leave-approval":
+    case "leave-approval":
   return (
     <div>
       <h3>Leave Approval Requests</h3>
@@ -280,34 +277,43 @@ const handleReplySave = async (id) => {
             <th>Leave Type</th>
             <th>Start Date</th>
             <th>End Date</th>
+            <th>Total Days</th>   {/* ✅ Added column */}
             <th>Status</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {leaveApproval.length ? leaveApproval.map(leave => (
-            <tr key={leave.id}>
-              <td>{leave.id}</td>
-              <td>{leave.employeeName || `EID-${leave.employee_id}`}</td> {/* fallback */}
-              <td>{leave.available_leaves ?? "—"}</td>
-              <td>{leave.leaveType}</td>
-              <td>{new Date(leave.startDate).toLocaleDateString()}</td>
-              <td>{new Date(leave.endDate).toLocaleDateString()}</td>
-              <td>
-                {leave.status === 'Pending' && <span style={{color:'#f0ad4e'}}>Pending</span>}
-                {leave.status === 'Approved' && <span style={{color:'#5cb85c'}}>Approved</span>}
-                {leave.status === 'Rejected' && <span style={{color:'#d9534f'}}>Rejected</span>}
-              </td>
-              <td>
-                {leave.status === 'Pending' && (
-                  <>
-                    <button className="icon-button" onClick={() => handleApprove(leave.id)}>✔</button>
-                    <button className="icon-button" onClick={() => handleReject(leave.id)}>✖</button>
-                  </>
-                )}
-              </td>
-            </tr>
-          )) : <tr><td colSpan="8">No leave requests found.</td></tr>}
+          {leaveApproval.length ? leaveApproval.map(leave => {
+            // ✅ Calculate total leaves (difference in days + 1)
+            const start = new Date(leave.startDate);
+            const end = new Date(leave.endDate);
+            const totalDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+
+            return (
+              <tr key={leave.id}>
+                <td>{leave.id}</td>
+                <td>{leave.employeeName || `EID-${leave.employee_id}`}</td> {/* fallback */}
+                <td>{leave.available_leaves ?? "—"}</td>
+                <td>{leave.leaveType}</td>
+                <td>{start.toLocaleDateString()}</td>
+                <td>{end.toLocaleDateString()}</td>
+                <td>{totalDays}</td>  {/* ✅ Display total leave days */}
+                <td>
+                  {leave.status === 'Pending' && <span style={{color:'#f0ad4e'}}>Pending</span>}
+                  {leave.status === 'Approved' && <span style={{color:'#5cb85c'}}>Approved</span>}
+                  {leave.status === 'Rejected' && <span style={{color:'#d9534f'}}>Rejected</span>}
+                </td>
+                <td>
+                  {leave.status === 'Pending' && (
+                    <>
+                      <button className="icon-button" onClick={() => handleApprove(leave.id)}>✔</button>
+                      <button className="icon-button" onClick={() => handleReject(leave.id)}>✖</button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            );
+          }) : <tr><td colSpan="9">No leave requests found.</td></tr>}
         </tbody>
       </table>
     </div>
